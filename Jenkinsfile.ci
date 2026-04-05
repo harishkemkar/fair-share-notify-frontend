@@ -12,29 +12,10 @@ pipeline {
     }
 
     stages {
-        stage('Install Dependencies') {
-            steps {
-                sh '''
-                echo "Installing frontend dependencies..."
-                npm install
-                '''
-            }
-        }
-
-        stage('Build Frontend') {
-            steps {
-                sh '''
-                echo "Building frontend with API URL=${VITE_API_URL}"
-                # Pass VITE_API_URL as environment variable during build
-                VITE_API_URL=${VITE_API_URL} npm run build
-                '''
-            }
-        }
-
         stage('Docker Build') {
             steps {
                 sh '''
-                echo "Building Docker image..."
+                echo "Building Docker image with API URL=${VITE_API_URL}"
                 docker build --build-arg VITE_API_URL=${VITE_API_URL} -t ${ECR_REPO}:${IMAGE_TAG} .
                 '''
             }
