@@ -1,0 +1,62 @@
+pipeline {
+    agent { label 'ec2-agent' }   // Jenkins node with Docker + AWS CLI
+
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag to push')
+        string(name: 'VITE_API_URL', defaultValue: 'http://localhost:4000', description: 'Backend API URL')
+        string(name: 'ECR_REPO', defaultValue: '445842911672.dkr.ecr.ap-southeast-1.amazonaws.com/fair-share-frontend', description: 'ECR repo URI')
+    }
+
+    environment {
+        AWS_REGION = 'ap-southeast-1'
+    }
+
+    stages {
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                echo "Installing frontend dependencies..."
+                npm install
+                '''
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                sh '''
+                echo "Building frontend with API URL=${VITE_API_URL}"
+                # Pass VITE_API_URL as environment variable during build
+                VITE_API_URL=${VITE_API_URL} npm run build
+                '''
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                echo "Building Docker image..."
+                docker build --build-arg VITE_API_URL=${VITE_API_URL} -t ${ECR_REPO}:${IMAGE_TAG} .
+                '''
+            }
+        }
+
+        stage('ECR Login') {
+            steps {
+                sh '''
+                echo "Logging in to ECR..."
+                aws ecr get-login-password --region ${AWS_REGION} \
+                  | docker login --username AWS --password-stdin ${ECR_REPO}
+                '''
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh '''
+                echo "Pushing image to ECR..."
+                docker push ${ECR_REPO}:${IMAGE_TAG}
+                '''
+            }
+        }
+    }
+}
