@@ -1,0 +1,110 @@
+pipeline {
+    agent { label 'ec2-agent' }   // run only on Jenkins node with label ec2-agent
+
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag to deploy')
+        string(name: 'DESIRED_COUNT', defaultValue: '1', description: 'Number of tasks to run')
+        string(name: 'TASK_FAMILY', defaultValue: 'fair-share-frontend', description: 'ECS task family name')
+        string(name: 'CLUSTER_ARN', defaultValue: 'arn:aws:ecs:ap-southeast-1:445842911672:cluster/fair-share-cluster', description: 'ECS cluster ARN')
+        string(name: 'SERVICE_NAME', defaultValue: 'frontend-service', description: 'ECS service name')
+    }
+
+    environment {
+        AWS_REGION   = 'ap-southeast-1'
+        TASK_FAMILY  = 'fair-share-frontend'
+        CLUSTER_ARN  = 'arn:aws:ecs:ap-southeast-1:445842911672:cluster/fair-share-cluster'
+        SERVICE_NAME = 'frontend-service'
+        IMAGE_REPO   = '445842911672.dkr.ecr.ap-southeast-1.amazonaws.com/fair-share-frontend'
+    }
+
+    stages {
+        stage('Update Task Definition') {
+            steps {
+                script {
+                    sh '''
+                    echo "Registering new task definition with image ${IMAGE_REPO}:${IMAGE_TAG}"
+
+                    REVISION=$(aws ecs register-task-definition \
+                        --family ${TASK_FAMILY} \
+                        --network-mode awsvpc \
+                        --requires-compatibilities FARGATE \
+                        --cpu 256 \
+                        --memory 512 \
+                        --execution-role-arn arn:aws:iam::445842911672:role/ecsTaskExecutionRolefairandshare \
+                        --container-definitions "[{
+                            \\"name\\": \\"frontend\\",
+                            \\"image\\": \\"${IMAGE_REPO}:${IMAGE_TAG}\\",
+                            \\"essential\\": true,
+                            \\"portMappings\\": [{
+                                \\"containerPort\\": 80,
+                                \\"hostPort\\": 80,
+                                \\"protocol\\": \\"tcp\\"
+                            }]
+                        }]" \
+                        --query 'taskDefinition.taskDefinitionArn' \
+                        --output text)
+
+                    echo "✅ New task definition registered: $REVISION"
+                    echo $REVISION > latest_taskdef.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Update ECS Service') {
+            steps {
+                script {
+                    sh '''
+                    echo "Updating ECS service ${SERVICE_NAME} to use latest task definition"
+                    LATEST_TASK_DEF=$(cat latest_taskdef.txt)
+
+                    aws ecs update-service \
+                        --cluster ${CLUSTER_ARN} \
+                        --service ${SERVICE_NAME} \
+                        --task-definition $LATEST_TASK_DEF \
+                        --desired-count ${DESIRED_COUNT} \
+                        --force-new-deployment \
+                        --query 'service.{ServiceName:serviceName,Desired:desiredCount,Running:runningCount,Pending:pendingCount}' \
+                        --output table
+
+                    echo "Waiting for tasks to stabilize..."
+                    aws ecs wait services-stable --cluster ${CLUSTER_ARN} --services ${SERVICE_NAME}
+
+                    echo "Fetching running task IDs..."
+                    TASK_ARN=$(aws ecs list-tasks --cluster ${CLUSTER_ARN} --service-name ${SERVICE_NAME} --desired-status RUNNING --query "taskArns[0]" --output text)
+
+                    echo "Describing task to get ENI..."
+                    ENI_ID=$(aws ecs describe-tasks --cluster ${CLUSTER_ARN} --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name==\\`networkInterfaceId\\`].value" --output text)
+
+                    echo "Fetching IPv4 address from ENI..."
+                    PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+                    PRIVATE_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].PrivateIpAddress" --output text)
+
+                    echo "Frontend Container Public IPv4: $PUBLIC_IP"
+                    echo "Frontend Container Private IPv4: $PRIVATE_IP"
+                    '''
+                }
+            }
+        }
+
+        stage('Rollback if Needed') {
+            when {
+                expression { currentBuild.result == 'FAILURE' }
+            }
+            steps {
+                script {
+                    sh '''
+                    echo "Rolling back ECS service ${SERVICE_NAME} to previous task definition"
+                    PREVIOUS_TASK_DEF=$(aws ecs list-task-definitions --family-prefix ${TASK_FAMILY} --sort DESC --max-items 2 --query "taskDefinitionArns[1]" --output text)
+
+                    aws ecs update-service \
+                        --cluster ${CLUSTER_ARN} \
+                        --service ${SERVICE_NAME} \
+                        --task-definition $PREVIOUS_TASK_DEF \
+                        --force-new-deployment
+                    '''
+                }
+            }
+        }
+    }
+}
